@@ -1,7 +1,8 @@
 import requests
 import time
+import json
 import logging
-from typing import List, Dict
+from typing import List, Dict, Set
 from config import (
     GAMMA_API, DATA_API, MIN_LIQUIDITY, MIN_MARKET_VOLUME
 )
@@ -10,7 +11,10 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_active_markets(limit: int = 500) -> List[Dict]:
-    """Fetch active markets from Gamma API, indexed by conditionId."""
+    """
+    Fetch active markets sorted by 24h volume (more relevant than total).
+    Filters out negativeRisk markets (different settlement mechanics).
+    """
     markets = []
     offset = 0
 
@@ -22,7 +26,7 @@ def fetch_active_markets(limit: int = 500) -> List[Dict]:
                 "closed": "false",
                 "limit": 100,
                 "offset": offset,
-                "order": "volume",
+                "order": "volume24hr",   # 24h volume = more relevant than all-time
                 "ascending": "false"
             }
             resp = requests.get(url, params=params, timeout=10)
@@ -32,6 +36,9 @@ def fetch_active_markets(limit: int = 500) -> List[Dict]:
                 break
 
             for m in batch:
+                # Skip negativeRisk markets — different settlement mechanics
+                if m.get("negativeRisk"):
+                    continue
                 liquidity = float(m.get("liquidity") or 0)
                 volume = float(m.get("volume") or 0)
                 if liquidity >= MIN_LIQUIDITY and volume >= MIN_MARKET_VOLUME:
@@ -46,124 +53,132 @@ def fetch_active_markets(limit: int = 500) -> List[Dict]:
             logger.error(f"Failed to fetch markets at offset {offset}: {e}")
             break
 
-    logger.info(f"Found {len(markets)} qualifying active markets")
+    logger.info(f"Found {len(markets)} qualifying active markets (negativeRisk filtered)")
     return markets[:limit]
 
 
-def fetch_wallet_positions(address: str) -> List[Dict]:
+def fetch_market_holders(condition_id: str, limit: int = 20) -> List[Dict]:
     """
-    Fetch active positions for a wallet.
-    Only returns positions with curPrice > 0 (market still live).
+    Fetch top holders for a market using the /holders endpoint.
+    This is the efficient approach: market-centric instead of wallet-centric.
+    Returns list of {proxyWallet, outcomeIndex, amount, name}.
     """
     try:
-        url = f"{DATA_API}/positions"
-        params = {
-            "user": address,
-            "sizeThreshold": "1",
-            "redeemable": "false",
-            "limit": 500
-        }
-        resp = requests.get(url, params=params, timeout=10)
+        url = f"{DATA_API}/holders"
+        params = {"market": condition_id, "limit": limit}
+        resp = requests.get(url, params=params, timeout=8)
         resp.raise_for_status()
         data = resp.json()
+
+        # API returns list of {token, holders:[...]}
         if not isinstance(data, list):
             return []
-        # Only positions in live markets (curPrice > 0)
-        return [p for p in data if float(p.get("curPrice") or 0) > 0]
+
+        holders = []
+        for token_data in data:
+            for h in token_data.get("holders", []):
+                holders.append({
+                    "proxyWallet": h.get("proxyWallet", ""),
+                    "outcomeIndex": h.get("outcomeIndex", 0),
+                    "amount": float(h.get("amount", 0) or 0),
+                    "name": h.get("name", "")
+                })
+        return holders
+
     except Exception as e:
-        logger.error(f"Positions fetch failed for {address[:8]}...: {e}")
+        logger.debug(f"Holders fetch failed for {condition_id[:12]}...: {e}")
         return []
 
 
-def build_market_consensus(top_wallets: List[Dict], active_markets: List[Dict]) -> List[Dict]:
+def build_market_consensus(
+    top_wallets: List[Dict],
+    active_markets: List[Dict]
+) -> List[Dict]:
     """
-    For each active market, count how many top wallets hold a position
-    and what direction. Returns markets sorted by total votes + consensus.
+    Market-centric approach: for each market, fetch top holders
+    and check overlap with our smart money set.
+
+    This is ~10x faster than the wallet-centric approach because:
+    - Old: 300 wallet API calls per cycle
+    - New: 1 API call per market (batched, only for markets with enough liquidity)
     """
-    # Index by conditionId for O(1) lookup
-    market_by_condition: Dict[str, Dict] = {}
-    for m in active_markets:
-        cid = m.get("conditionId", "")
-        if cid:
-            market_by_condition[cid] = m
+    from wallet_scorer import get_smart_money_set
+    smart_money = get_smart_money_set(top_wallets)
+    wallet_score_map = {w["address"]: w["score"] for w in top_wallets}
 
-    logger.info(f"Scanning positions for {len(top_wallets)} wallets...")
+    logger.info(f"Scanning {len(active_markets)} markets for smart money consensus...")
 
-    market_votes: Dict[str, Dict] = {}
-
-    for wallet in top_wallets:
-        address = wallet["address"]
-        positions = fetch_wallet_positions(address)
-        time.sleep(0.1)
-
-        for pos in positions:
-            cid = pos.get("conditionId", "")
-            if not cid or cid not in market_by_condition:
-                continue
-
-            outcome = pos.get("outcome", "").upper()
-            cur_price = float(pos.get("curPrice") or 0)
-            size = float(pos.get("size") or 0)
-
-            if cur_price <= 0 or size < 1:
-                continue
-            if "YES" not in outcome and "NO" not in outcome:
-                continue
-
-            if cid not in market_votes:
-                market_votes[cid] = {
-                    "market": market_by_condition[cid],
-                    "yes_count": 0,
-                    "no_count": 0,
-                    "yes_price": 0.0,
-                    "no_price": 0.0,
-                    "yes_token_id": "",
-                    "no_token_id": "",
-                    "wallet_details": []
-                }
-
-            if "YES" in outcome:
-                market_votes[cid]["yes_count"] += 1
-                market_votes[cid]["yes_price"] = cur_price
-                market_votes[cid]["yes_token_id"] = pos.get("asset", "")
-            else:
-                market_votes[cid]["no_count"] += 1
-                market_votes[cid]["no_price"] = cur_price
-                market_votes[cid]["no_token_id"] = pos.get("asset", "")
-
-            market_votes[cid]["wallet_details"].append({
-                "address": address[:10] + "...",
-                "outcome": outcome,
-                "size": round(size, 2),
-                "cur_price": cur_price,
-                "score": round(wallet["score"], 4)
-            })
-
-    # Build results
     results = []
-    for cid, data in market_votes.items():
-        yes = data["yes_count"]
-        no = data["no_count"]
-        total_votes = yes + no
 
+    for i, market in enumerate(active_markets):
+        cid = market.get("conditionId", "")
+        if not cid:
+            continue
+
+        holders = fetch_market_holders(cid, limit=20)
+        if not holders:
+            continue
+
+        # Check which holders are in our smart money set
+        yes_wallets = []
+        no_wallets = []
+
+        for h in holders:
+            addr = h.get("proxyWallet", "")
+            if addr not in smart_money:
+                continue
+            amount = h.get("amount", 0)
+            if amount < 1:
+                continue
+
+            outcome_idx = h.get("outcomeIndex", 0)
+            if outcome_idx == 0:
+                yes_wallets.append({"address": addr, "amount": amount, "score": wallet_score_map.get(addr, 0)})
+            else:
+                no_wallets.append({"address": addr, "amount": amount, "score": wallet_score_map.get(addr, 0)})
+
+        total_votes = len(yes_wallets) + len(no_wallets)
         if total_votes < 2:
             continue
 
-        dominant_side = "YES" if yes >= no else "NO"
-        consensus_pct = max(yes, no) / total_votes
-        dominant_price = data["yes_price"] if dominant_side == "YES" else data["no_price"]
-        dominant_token_id = data["yes_token_id"] if dominant_side == "YES" else data["no_token_id"]
+        dominant_side = "YES" if len(yes_wallets) >= len(no_wallets) else "NO"
+        dominant_count = max(len(yes_wallets), len(no_wallets))
+        consensus_pct = dominant_count / total_votes
 
-        market = data["market"]
-
-        # Extract clobTokenIds for price fetching
+        # Get price from market data
         clob_tokens = market.get("clobTokenIds") or []
         if isinstance(clob_tokens, str):
             try:
-                import json
                 clob_tokens = json.loads(clob_tokens)
             except Exception:
                 clob_tokens = []
+
+        # Use market's outcome prices if available
+        outcomes = market.get("outcomes") or []
+        outcome_prices = market.get("outcomePrices") or []
+
+        dominant_price = 0.0
+        dominant_token_id = ""
+
+        if dominant_side == "YES" and len(clob_tokens) > 0:
+            dominant_token_id = clob_tokens[0]
+            if outcome_prices and len(outcome_prices) > 0:
+                try:
+                    dominant_price = float(outcome_prices[0])
+                except Exception:
+                    pass
+        elif dominant_side == "NO" and len(clob_tokens) > 1:
+            dominant_token_id = clob_tokens[1]
+            if outcome_prices and len(outcome_prices) > 1:
+                try:
+                    dominant_price = float(outcome_prices[1])
+                except Exception:
+                    pass
+
+        # Fallback to lastTradePrice
+        if dominant_price <= 0:
+            last_price = float(market.get("lastTradePrice") or 0)
+            dominant_price = last_price if dominant_side == "YES" else 1.0 - last_price
 
         results.append({
             "market_id": market.get("id", cid),
@@ -173,17 +188,39 @@ def build_market_consensus(top_wallets: List[Dict], active_markets: List[Dict]) 
             "end_date": market.get("endDate") or market.get("end_date", ""),
             "liquidity": float(market.get("liquidity") or 0),
             "volume": float(market.get("volume") or 0),
+            "volume_24hr": float(market.get("volume24hr") or 0),
             "dominant_side": dominant_side,
             "dominant_price": dominant_price,
             "dominant_token_id": dominant_token_id,
             "clob_token_ids": clob_tokens,
-            "yes_count": yes,
-            "no_count": no,
+            "yes_count": len(yes_wallets),
+            "no_count": len(no_wallets),
             "total_votes": total_votes,
             "consensus_pct": round(consensus_pct, 4),
-            "wallet_details": data["wallet_details"]
+            "wallet_details": (yes_wallets if dominant_side == "YES" else no_wallets)[:5]
         })
+
+        # Rate limit friendly
+        time.sleep(0.05)
+
+        if (i + 1) % 50 == 0:
+            logger.info(f"  Scanned {i+1}/{len(active_markets)} markets, {len(results)} with consensus so far...")
 
     results.sort(key=lambda x: (x["total_votes"], x["consensus_pct"]), reverse=True)
     logger.info(f"Found consensus data for {len(results)} markets")
     return results
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    from wallet_scorer import get_top_wallets
+
+    wallets = get_top_wallets()
+    markets = fetch_active_markets(limit=100)
+    consensus = build_market_consensus(wallets, markets)
+
+    print(f"\nTop consensus signals:")
+    for s in consensus[:10]:
+        print(f"  [{s['total_votes']} wallets | {s['consensus_pct']:.0%}] {s['question'][:60]}")
+        print(f"  → {s['dominant_side']} @ {s['dominant_price']:.1%} | vol24h=${s['volume_24hr']:,.0f}")
+        print()

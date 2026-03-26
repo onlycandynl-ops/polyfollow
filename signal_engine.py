@@ -3,7 +3,8 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 from config import (
     CONSENSUS_THRESHOLD, MIN_PRICE, MAX_PRICE,
-    MIN_LIQUIDITY, MIN_MARKET_VOLUME, MIN_HOURS_LEFT
+    MIN_LIQUIDITY, MIN_MARKET_VOLUME, MIN_HOURS_LEFT,
+    TAKER_FEE
 )
 
 logger = logging.getLogger(__name__)
@@ -11,29 +12,31 @@ logger = logging.getLogger(__name__)
 
 def calculate_edge(consensus_pct: float, market_price: float, dominant_side: str) -> float:
     """
-    Edge = divergence between smart money implied probability and market price.
-    For YES: smart money thinks YES is more likely than market prices it.
-    For NO: smart money thinks NO is more likely, meaning YES is LESS likely.
+    Edge = divergence between smart money implied probability and market price,
+    AFTER accounting for taker fees on both entry and exit.
+
+    Fees eat into edge: a 2% taker fee applied at entry and exit means
+    you need >4% gross edge just to break even.
     """
-    # Implied probability from consensus
     implied_prob = 0.5 + (consensus_pct - 0.5) * 1.5
     implied_prob = max(0.01, min(0.99, implied_prob))
 
     if dominant_side == "YES":
-        # We buy YES — edge is how much implied > market price
-        edge = implied_prob - market_price
+        gross_edge = implied_prob - market_price
     else:
-        # We buy NO — market prices NO at (1 - yes_price)
-        # Edge is how much implied prob of NO > market's implied NO prob
-        implied_no_prob = 1.0 - implied_prob
-        market_no_prob = 1.0 - market_price  # market_price here is NO price
-        edge = implied_no_prob - market_no_prob
+        implied_no = 1.0 - implied_prob
+        market_no = 1.0 - market_price
+        gross_edge = implied_no - market_no
 
-    return round(edge, 4)
+    # Subtract round-trip fee cost
+    fee_cost = TAKER_FEE * 2
+    net_edge = gross_edge - fee_cost
+
+    return round(net_edge, 4)
 
 
 def is_market_valid(signal: Dict) -> Tuple[bool, str]:
-    """Validate market quality. Returns (valid, reason)."""
+    """Validate market quality."""
     price = signal.get("dominant_price", 0)
     liquidity = signal.get("liquidity", 0)
     volume = signal.get("volume", 0)
@@ -55,7 +58,7 @@ def is_market_valid(signal: Dict) -> Tuple[bool, str]:
             end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00")).replace(tzinfo=None)
             hours_left = (end_dt - datetime.now()).total_seconds() / 3600
             if hours_left < MIN_HOURS_LEFT:
-                return False, f"Market ending too soon ({hours_left:.0f}h)"
+                return False, f"Ending too soon ({hours_left:.0f}h)"
         except Exception:
             pass
 
@@ -68,33 +71,31 @@ def filter_signals(consensus_signals: List[Dict]) -> List[Dict]:
     rejected = {"low_consensus": 0, "invalid_market": 0, "low_edge": 0}
 
     for signal in consensus_signals:
-        # 1. Consensus threshold
         if signal["consensus_pct"] < CONSENSUS_THRESHOLD:
             rejected["low_consensus"] += 1
             continue
 
-        # 2. Market validity
         valid, reason = is_market_valid(signal)
         if not valid:
             rejected["invalid_market"] += 1
             logger.debug(f"Rejected '{signal['question'][:40]}': {reason}")
             continue
 
-        # 3. Edge calculation
         edge = calculate_edge(
             signal["consensus_pct"],
             signal["dominant_price"],
             signal["dominant_side"]
         )
 
-        if edge < 0.05:
+        # Minimum net edge after fees
+        if edge < 0.03:
             rejected["low_edge"] += 1
             continue
 
         actionable.append({
             **signal,
             "edge": edge,
-            "signal_strength": round(signal["consensus_pct"] * (1 + edge), 4),
+            "signal_strength": round(signal["consensus_pct"] * (1 + max(edge, 0)), 4),
             "generated_at": datetime.now().isoformat()
         })
 
@@ -111,7 +112,7 @@ def filter_signals(consensus_signals: List[Dict]) -> List[Dict]:
 
 
 def deduplicate_signals(new_signals: List[Dict], existing_positions: List[Dict]) -> List[Dict]:
-    """Remove signals for markets we already have a position in."""
+    """Remove signals for markets we already hold."""
     existing = {p.get("condition_id") or p["market_id"] for p in existing_positions}
     fresh = [s for s in new_signals if (s.get("condition_id") or s["market_id"]) not in existing]
     dupes = len(new_signals) - len(fresh)

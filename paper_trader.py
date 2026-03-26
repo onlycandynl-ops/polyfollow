@@ -7,14 +7,13 @@ from typing import List, Dict, Optional, Tuple
 from config import (
     PAPER_BANKROLL, TRADE_SIZE_PCT, MAX_OPEN_POSITIONS,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, PAPER_STATE_FILE,
-    TRADE_LOG_FILE, CLOB_API, DATA_API
+    TRADE_LOG_FILE, CLOB_API, TAKER_FEE
 )
 
 logger = logging.getLogger(__name__)
 
 
 def load_state() -> Dict:
-    """Load paper trading state from disk."""
     try:
         with open(PAPER_STATE_FILE, "r") as f:
             return json.load(f)
@@ -31,41 +30,36 @@ def load_state() -> Dict:
 
 
 def save_state(state: Dict):
-    """Persist paper trading state to disk."""
     os.makedirs("data", exist_ok=True)
     with open(PAPER_STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
 
-def fetch_current_price(token_id: str, condition_id: str, side: str) -> Optional[float]:
+def fetch_current_price(token_id: str, condition_id: str) -> Optional[float]:
     """
-    Fetch live price via CLOB API using token_id.
-    Falls back to Data API positions if token_id unavailable.
+    Fetch live price via CLOB midpoint by token_id.
+    Falls back to last trade price.
     """
-    # Primary: CLOB midpoint price by token_id
     if token_id:
         try:
             resp = requests.get(f"{CLOB_API}/midpoint?token_id={token_id}", timeout=8)
             if resp.status_code == 200:
-                data = resp.json()
-                mid = data.get("mid")
+                mid = resp.json().get("mid")
                 if mid is not None:
                     return float(mid)
         except Exception:
             pass
 
-        # Fallback: CLOB last trade price
         try:
             resp = requests.get(f"{CLOB_API}/last-trade-price?token_id={token_id}", timeout=8)
             if resp.status_code == 200:
-                data = resp.json()
-                price = data.get("price")
+                price = resp.json().get("price")
                 if price is not None:
                     return float(price)
         except Exception:
             pass
 
-    # Last resort: check if market resolved via Gamma
+    # Fallback: check if market resolved via Gamma
     if condition_id:
         try:
             resp = requests.get(
@@ -76,46 +70,51 @@ def fetch_current_price(token_id: str, condition_id: str, side: str) -> Optional
                 markets = resp.json()
                 if markets:
                     m = markets[0]
-                    # If market resolved
-                    if m.get("closed") or not m.get("active"):
-                        winning = m.get("winnerOutcome", "").upper()
-                        if winning:
-                            return 1.0 if winning in side.upper() else 0.0
+                    if not m.get("active") or m.get("closed"):
+                        winner = (m.get("winnerOutcome") or "").upper()
+                        token_outcome = m.get("outcomes", ["YES", "NO"])
+                        # Check if this token won
+                        if winner:
+                            # outcomeIndex 0 = YES, 1 = NO
+                            return 1.0 if "YES" in winner else 0.0
         except Exception:
             pass
 
-    logger.warning(f"Could not fetch price for token {token_id[:12] if token_id else 'N/A'}...")
     return None
 
 
 def open_position(state: Dict, signal: Dict) -> Tuple[bool, str]:
-    """Open a new paper trade position."""
+    """Open a paper trade, deducting entry fee from cost."""
     if len(state["positions"]) >= MAX_OPEN_POSITIONS:
         return False, f"Max positions reached ({MAX_OPEN_POSITIONS})"
 
-    trade_size = round(state["bankroll"] * TRADE_SIZE_PCT, 2)
-    if trade_size < 1.0:
+    gross_size = round(state["bankroll"] * TRADE_SIZE_PCT, 2)
+    if gross_size < 1.0:
         return False, "Bankroll too low to trade"
 
     entry_price = signal["dominant_price"]
     if not entry_price or entry_price <= 0:
         return False, "Invalid entry price"
 
-    shares = round(trade_size / entry_price, 2)
-    token_id = signal.get("dominant_token_id", "")
+    # Entry fee reduces effective position size
+    entry_fee = round(gross_size * TAKER_FEE, 4)
+    net_cost = round(gross_size - entry_fee, 2)
+    shares = round(net_cost / entry_price, 2)
 
     position = {
         "id": f"{signal.get('condition_id', signal['market_id'])}_{signal['dominant_side']}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
         "market_id": signal["market_id"],
         "condition_id": signal.get("condition_id", ""),
-        "token_id": token_id,
+        "token_id": signal.get("dominant_token_id", ""),
         "question": signal["question"],
         "side": signal["dominant_side"],
         "entry_price": entry_price,
         "shares": shares,
-        "cost": trade_size,
+        "gross_cost": gross_size,
+        "entry_fee": entry_fee,
+        "net_cost": net_cost,
         "stop_loss": round(entry_price * (1 + STOP_LOSS_PCT), 4),
-        "take_profit": round(min(entry_price * (1 + TAKE_PROFIT_PCT), 0.97), 4),
+        "take_profit": round(min(entry_price * (1 + TAKE_PROFIT_PCT), 0.95), 4),
         "consensus_pct": signal["consensus_pct"],
         "edge": signal["edge"],
         "wallet_count": signal["total_votes"],
@@ -126,34 +125,35 @@ def open_position(state: Dict, signal: Dict) -> Tuple[bool, str]:
     }
 
     state["positions"].append(position)
-    state["bankroll"] = round(state["bankroll"] - trade_size, 2)
+    state["bankroll"] = round(state["bankroll"] - gross_size, 2)
     state["total_trades"] += 1
 
     log_trade(position, "OPEN")
-    return True, f"Opened {signal['dominant_side']} on '{signal['question'][:50]}' @ {entry_price:.1%} | Size: ${trade_size:.2f}"
+    return True, f"Opened {signal['dominant_side']} on '{signal['question'][:50]}' @ {entry_price:.1%} | Size: ${gross_size:.2f} (fee: ${entry_fee:.2f})"
 
 
 def update_positions(state: Dict) -> List[Dict]:
-    """Update open positions, check stop-loss/take-profit/resolution."""
+    """Update positions, check stop-loss/take-profit/resolution."""
     closed_this_cycle = []
 
     for pos in state["positions"][:]:
         current_price = fetch_current_price(
             pos.get("token_id", ""),
-            pos.get("condition_id", ""),
-            pos["side"]
+            pos.get("condition_id", "")
         )
         if current_price is None:
             continue
 
         pos["current_price"] = current_price
-        current_value = pos["shares"] * current_price
-        pos["pnl"] = round(current_value - pos["cost"], 2)
+
+        # Calculate P&L including exit fee
+        exit_fee = round(pos["shares"] * current_price * TAKER_FEE, 4)
+        gross_value = pos["shares"] * current_price
+        net_value = gross_value - exit_fee
+        pos["pnl"] = round(net_value - pos["net_cost"], 2)
         pos["pnl_pct"] = round((current_price - pos["entry_price"]) / pos["entry_price"], 4)
 
         close_reason = None
-
-        # Market resolved — price goes to 1.0 (win) or 0.0 (loss)
         if current_price >= 0.98:
             close_reason = "RESOLVED_WIN"
         elif current_price <= 0.02:
@@ -171,16 +171,22 @@ def update_positions(state: Dict) -> List[Dict]:
 
 
 def close_position(state: Dict, position: Dict, reason: str) -> Dict:
-    """Close a position and return funds to bankroll."""
+    """Close a position, deducting exit fee."""
     exit_price = position["current_price"]
-    exit_value = round(position["shares"] * exit_price, 2)
-    pnl = round(exit_value - position["cost"], 2)
+    exit_fee = round(position["shares"] * exit_price * TAKER_FEE, 4)
+    gross_exit_value = round(position["shares"] * exit_price, 2)
+    net_exit_value = round(gross_exit_value - exit_fee, 2)
+    pnl = round(net_exit_value - position["net_cost"], 2)
     pnl_pct = round((exit_price - position["entry_price"]) / position["entry_price"], 4)
+    total_fees = round(position["entry_fee"] + exit_fee, 4)
 
     closed = {
         **position,
         "exit_price": exit_price,
-        "exit_value": exit_value,
+        "exit_fee": exit_fee,
+        "gross_exit_value": gross_exit_value,
+        "net_exit_value": net_exit_value,
+        "total_fees": total_fees,
         "pnl": pnl,
         "pnl_pct": pnl_pct,
         "close_reason": reason,
@@ -189,7 +195,7 @@ def close_position(state: Dict, position: Dict, reason: str) -> Dict:
 
     state["positions"].remove(position)
     state["closed_positions"].append(closed)
-    state["bankroll"] = round(state["bankroll"] + exit_value, 2)
+    state["bankroll"] = round(state["bankroll"] + net_exit_value, 2)
 
     if pnl > 0:
         state["wins"] += 1
@@ -201,7 +207,6 @@ def close_position(state: Dict, position: Dict, reason: str) -> Dict:
 
 
 def get_portfolio_summary(state: Dict) -> Dict:
-    """Calculate portfolio stats."""
     open_value = sum(
         p["shares"] * p.get("current_price", p["entry_price"])
         for p in state["positions"]
@@ -227,7 +232,6 @@ def get_portfolio_summary(state: Dict) -> Dict:
 
 
 def log_trade(trade: Dict, action: str):
-    """Append trade to log file."""
     try:
         os.makedirs("data", exist_ok=True)
         logs = []

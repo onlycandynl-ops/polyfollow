@@ -51,39 +51,32 @@ def run_cycle():
     try:
         state = load_state()
 
-        # Update existing positions (stop-loss / take-profit / resolution)
         closed = update_positions(state)
         for pos in closed:
             notify_trade_closed(pos)
             logger.info(
                 f"Closed: {pos['question'][:50]} | "
                 f"P&L: ${pos['pnl']:+.2f} ({pos['pnl_pct']:+.1%}) | "
+                f"Fees: ${pos.get('total_fees', 0):.2f} | "
                 f"Reason: {pos['close_reason']}"
             )
 
-        # Get wallets (auto-refreshes every 24h)
         wallets = get_wallets()
         if not wallets:
             logger.warning("No qualifying wallets found, skipping scan")
             save_state(state)
             return
 
-        # Scan markets + build consensus
-        markets = fetch_active_markets(limit=500)
+        markets = fetch_active_markets(limit=300)
         if not markets:
             logger.warning("No active markets found")
             save_state(state)
             return
 
         consensus = build_market_consensus(wallets, markets)
-
-        # Filter to actionable signals
         signals = filter_signals(consensus)
-
-        # Remove markets we're already in
         signals = deduplicate_signals(signals, state["positions"])
 
-        # Execute paper trades
         opened_count = 0
         for signal in signals[:MAX_TRADES_PER_CYCLE]:
             success, msg = open_position(state, signal)
@@ -112,19 +105,15 @@ def run_cycle():
 
 
 def main():
-    logger.info("🚀 PolyFollow starting up...")
+    logger.info("🚀 PolyFollow v2 starting up...")
 
     state = load_state()
     portfolio = get_portfolio_summary(state)
     notify_startup(portfolio)
 
-    # Pre-load wallets
     get_wallets(force=True)
-
-    # Run immediately
     run_cycle()
 
-    # Schedule
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_cycle)
     schedule.every().day.at("06:00").do(lambda: get_wallets(force=True))
 

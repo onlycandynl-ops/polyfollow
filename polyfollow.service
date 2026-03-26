@@ -1,0 +1,16 @@
+[Unit]
+Description=PolyFollow Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polyfollow
+ExecStart=/usr/bin/python3 /root/polyfollow/main.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/root/polyfollow/logs/polyfollow.log
+StandardError=append:/root/polyfollow/logs/polyfollow.log
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,7 @@ import time
 import logging
 import schedule
 from datetime import datetime
-from config import SCAN_INTERVAL_MINUTES, WALLET_REFRESH_HOURS
+from config import SCAN_INTERVAL_MINUTES, WALLET_REFRESH_HOURS, MAX_TRADES_PER_CYCLE
 
 from wallet_scorer import get_top_wallets
 from scanner import fetch_active_markets, build_market_consensus
@@ -26,65 +26,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global wallet cache
 _top_wallets = []
 _wallets_loaded_at = None
 
 
 def get_wallets(force: bool = False):
     global _top_wallets, _wallets_loaded_at
-    now = datetime.utcnow()
+    now = datetime.now()
     stale = (
         _wallets_loaded_at is None or
         (now - _wallets_loaded_at).total_seconds() > WALLET_REFRESH_HOURS * 3600
     )
     if force or stale or not _top_wallets:
         logger.info("Refreshing top wallet list...")
-        _top_wallets = get_top_wallets(force_refresh=force)
+        _top_wallets = get_top_wallets(force_refresh=True)
         _wallets_loaded_at = now
     return _top_wallets
 
 
 def run_cycle():
     logger.info("=" * 60)
-    logger.info(f"Starting scan cycle at {datetime.utcnow().isoformat()}")
+    logger.info(f"Scan cycle at {datetime.now().isoformat()}")
 
     try:
-        # 1. Load state
         state = load_state()
 
-        # 2. Update existing positions (check stop-loss / take-profit)
+        # Update existing positions (stop-loss / take-profit / resolution)
         closed = update_positions(state)
         for pos in closed:
             notify_trade_closed(pos)
-            logger.info(f"Closed: {pos['question'][:50]} | P&L: ${pos['pnl']:+.2f} ({pos['pnl_pct']:+.1%}) | Reason: {pos['close_reason']}")
+            logger.info(
+                f"Closed: {pos['question'][:50]} | "
+                f"P&L: ${pos['pnl']:+.2f} ({pos['pnl_pct']:+.1%}) | "
+                f"Reason: {pos['close_reason']}"
+            )
 
-        # 3. Get top wallets
+        # Get wallets (auto-refreshes every 24h)
         wallets = get_wallets()
         if not wallets:
             logger.warning("No qualifying wallets found, skipping scan")
             save_state(state)
             return
 
-        # 4. Scan active markets
-        markets = fetch_active_markets(limit=200)
+        # Scan markets + build consensus
+        markets = fetch_active_markets(limit=500)
         if not markets:
             logger.warning("No active markets found")
             save_state(state)
             return
 
-        # 5. Build consensus
         consensus = build_market_consensus(wallets, markets)
 
-        # 6. Filter to actionable signals
+        # Filter to actionable signals
         signals = filter_signals(consensus)
 
-        # 7. Remove duplicates (markets already in portfolio)
+        # Remove markets we're already in
         signals = deduplicate_signals(signals, state["positions"])
 
-        # 8. Execute paper trades (max 3 per cycle to avoid overconcentration)
+        # Execute paper trades
         opened_count = 0
-        for signal in signals[:3]:
+        for signal in signals[:MAX_TRADES_PER_CYCLE]:
             success, msg = open_position(state, signal)
             if success:
                 opened_count += 1
@@ -93,10 +94,8 @@ def run_cycle():
             else:
                 logger.info(f"Skipped: {msg}")
 
-        # 9. Save state
         save_state(state)
 
-        # 10. Notify summary
         portfolio = get_portfolio_summary(state)
         notify_scan_complete(signals, opened_count, portfolio)
 
@@ -115,20 +114,21 @@ def run_cycle():
 def main():
     logger.info("🚀 PolyFollow starting up...")
 
-    # Initial startup notification
     state = load_state()
     portfolio = get_portfolio_summary(state)
     notify_startup(portfolio)
 
-    # Run immediately on start
+    # Pre-load wallets
+    get_wallets(force=True)
+
+    # Run immediately
     run_cycle()
 
-    # Schedule recurring runs
+    # Schedule
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_cycle)
-    # Refresh wallets daily at 6am UTC
     schedule.every().day.at("06:00").do(lambda: get_wallets(force=True))
 
-    logger.info(f"Scheduled: scan every {SCAN_INTERVAL_MINUTES} min | wallet refresh every {WALLET_REFRESH_HOURS}h")
+    logger.info(f"Scheduled: scan every {SCAN_INTERVAL_MINUTES}min | wallet refresh every {WALLET_REFRESH_HOURS}h")
 
     while True:
         schedule.run_pending()

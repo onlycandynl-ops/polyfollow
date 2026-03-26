@@ -13,28 +13,31 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
 # === Wallet Scoring ===
-TOP_N_WALLETS = 30           # Track top N wallets
-MIN_TRADES = 20              # Min trades to be considered
-MIN_ROI = 0.05               # Min 5% ROI to be in top list
-SCORE_WINDOW_DAYS = 30       # Rolling window for scoring
+TOP_N_WALLETS = 200
+WALLET_CATEGORIES = ["POLITICS", "ECONOMICS", "CULTURE", "TECH", "FINANCE"]
+MIN_PNL = 1000          # Min $1k PNL to qualify
+MIN_VOLUME = 5000       # Min $5k volume to qualify
+SCORE_WINDOW = "MONTH"  # Leaderboard window
 
 # === Signal Engine ===
-CONSENSUS_THRESHOLD = 0.70   # 70% of top wallets must agree
-MIN_LIQUIDITY = 1000         # Min $1000 liquidity in market
-MIN_PRICE = 0.05             # Min 5% (avoid near-zero markets)
-MAX_PRICE = 0.95             # Max 95% (avoid near-certain markets)
-MIN_VOLUME = 5000            # Min $5000 volume
+CONSENSUS_THRESHOLD = 0.60   # 60% of wallets in that market must agree
+MIN_LIQUIDITY = 1000         # Min $1000 liquidity
+MIN_MARKET_VOLUME = 5000     # Min $5000 volume
+MIN_PRICE = 0.05             # Min 5%
+MAX_PRICE = 0.95             # Max 95%
+MIN_HOURS_LEFT = 24          # Market must have > 24h left
+MAX_TRADES_PER_CYCLE = 5     # Max new trades per scan cycle
 
 # === Paper Trading ===
-PAPER_BANKROLL = 1000.0      # Starting paper bankroll in USDC
-TRADE_SIZE_PCT = 0.02        # 2% of bankroll per trade
-MAX_OPEN_POSITIONS = 10      # Max concurrent positions
-STOP_LOSS_PCT = -0.50        # Stop loss at -50%
-TAKE_PROFIT_PCT = 0.80       # Take profit at +80%
+PAPER_BANKROLL = 1000.0
+TRADE_SIZE_PCT = 0.02        # 2% per trade
+MAX_OPEN_POSITIONS = 15
+STOP_LOSS_PCT = -0.50        # -50%
+TAKE_PROFIT_PCT = 0.80       # +80%
 
 # === Timing ===
-SCAN_INTERVAL_MINUTES = 60   # Scan every 60 minutes
-WALLET_REFRESH_HOURS = 24    # Refresh wallet scores daily
+SCAN_INTERVAL_MINUTES = 60
+WALLET_REFRESH_HOURS = 24
 
 # === Paths ===
 DATA_DIR = "data"
